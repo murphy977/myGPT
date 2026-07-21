@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 
 
@@ -14,6 +15,7 @@ class CausalSelfAttention(nn.Module):
     assert config.n_embd % config.n_head == 0
     self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
     self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+    self.c_proj.NANOGPT_SCALE_INIT = True  # type: ignore # 让权重初始化时乘上一个系数，避免大模型梯度爆炸
     self.n_embd = config.n_embd
     self.n_head = config.n_head
     self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -40,6 +42,7 @@ class MLP(nn.Module):
     self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
     self.gelu = nn.GELU(approximate='tanh')
     self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+    self.c_proj.NANOGPT_SCALE_INIT = True  # type: ignore # 让权重初始化时乘上一个系数，避免大模型梯度爆炸
 
   def forward(self, x):
     x = self.c_fc(x)
@@ -81,6 +84,19 @@ class GPT(nn.Module):
     ))
 
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    self.transformer.wte.weight = self.lm_head.weight  # type: ignore # weight tying
+    self.apply(self._init_weights)  # type: ignore # initialize weights
+
+  def _init_weights(self, module):
+    if isinstance(module, nn.Linear):
+      std = 0.02
+      if hasattr(module, 'NANOGPT_SCALE_INIT'):
+        std *= (2 * self.config.n_layer) ** -0.5
+      torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+      if module.bias is not None:
+        torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
   def forward(self, idx, targets=None):
     B, T = idx.size()
@@ -145,4 +161,97 @@ class GPT(nn.Module):
           sd[k].copy_(sd_hf[k])
 
     return model
+  
+class DataloaderLite:
+  """一个轻量级的 dataloader，直接从文本文件中读取数据"""
+  def __init__(self, B, T):
+    self.B = B
+    self.T = T
+    with open('input.txt', 'r') as f:
+      text = f.read()
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode(text)
+    self.tokens = torch.tensor(tokens)
+    print(f"Loaded {len(self.tokens)} tokens from input.txt")
+    print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+    # 记录读到哪了
+    self.current_position = 0
+
+  def next_batch(self):
+    """返回一个 batch 的数据"""
+    B, T = self.B, self.T
+    buf = self.tokens[self.current_position: self.current_position + B * T + 1]
+    x = buf[:-1].view(B, T) # 输入
+    y = buf[1:].view(B, T)  # 目标（右移一位）
+    self.current_position += B * T  # 光标前进B * T
+    # 如果下一批会越界， 就从头开始
+    if self.current_position + B * T + 1 > len(self.tokens):
+      self.current_position = 0
+    return x, y
+
+
+
+
+if __name__ == "__main__":
+  num_return_sequences = 5  # 生成的文本数量
+  max_length = 30          # 生成的最大长度
+
+  # choose a device (mps, cuda, cpu)
+  device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+  print(f"Using device: {device}")
+  
+  # -------------------------------------------------------
+  # 不同设备都选择相同的随机种子
+  torch.manual_seed(42)
+  if device == 'cuda':
+      torch.cuda.manual_seed(42)
+
+  train_loader = DataloaderLite(B=4, T=32)
+
+  # model = GPT.from_pretrained('gpt2')
+  model = GPT(GPTConfig())
+  model.eval()  # 切换到评估模式
+  model.to(device)  # 将模型移动到设备上
+
+  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+  for i in range(50):
+      x, y = train_loader.next_batch()
+      x, y = x.to(device), y.to(device)
+      optimizer.zero_grad()
+      logits, loss = model(x, y)
+      loss.backward()
+      optimizer.step()
+      print(f"Step {i}, Loss: {loss.item()}")
+
+
+
+  import sys; sys.exit(0)
+
+  # -------------------------------------------------------
+
+  # 用tikenizer将输入文本转换为模型的输入格式
+  import tiktoken
+  enc = tiktoken.get_encoding("gpt2")
+  tokens = enc.encode("Hello, I'm a language model,") # 将输入文本编码为token
+  tokens = torch.tensor(tokens, dtype=torch.long) # 将token转换为tensor
+  tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # 重复输入以生成多条文本
+  x = tokens.to(device) # 将输入tensor移动到设备上
+
+  # 自回归生成： 依次添加一个token，直到达到最大长度
+  torch.manual_seed(42)  # 设置随机种子以获得可重复的结果
+  for _ in range(max_length):
+    with torch.no_grad():
+      x_cond = x[:, -model.config.block_size:]  # 取最后block_size个token作为输入
+      logits, _ = model(x_cond)  # 前向传播得到logits
+      logits = logits[:, -1, :] # 取最后一个token的logits B, T, C --> B, C
+      probs = F.softmax(logits, dim=-1) # 计算概率分布
+      topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1) # 取top-k个概率最大的token
+      next_token = torch.multinomial(topk_probs, num_samples=1) # 从top-k中采样一个token
+      next_token = torch.gather(topk_indices, -1, next_token) # 将采样的token映射回原始的token id
+      x = torch.cat((x, next_token), dim=1) # 将采样的token添加到输入中，继续生成下一个token
+
+  # 将生成的token转换回文本
+  for i in range(num_return_sequences):
+      tokens = x[i, :max_length].tolist()
+      print(">", enc.decode(tokens))
 
